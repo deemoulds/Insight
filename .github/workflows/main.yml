@@ -1,0 +1,16 @@
+Load pandas as pd 
+
+df = pd.read_csv("laptops.csv", encoding="latin1")print(df.columns)
+
+
+f clean_column_names(df):
+    df.columns = (df.columns
+               .str.strip()
+               .str.lower()
+               .str.replace(" ", "_")
+               .str.replace("[()€$]", "",regex=True))
+    return df
+
+
+df = clean_column_names(df)
+print(df.columns)
