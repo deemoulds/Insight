@@ -1,0 +1,128 @@
+import asyncio
+import aiohttp
+import pandas as pd
+import sqlite3
+import os
+import re
+from datetime import datetime
+from dateutil.parser import isoparse
+from io import StringIO
+
+# ------------------------------------------------------------
+# Configuration (portable – no platform dependencies)
+# ------------------------------------------------------------
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+OUTPUT_DIR = os.path.join(BASE_DIR, "output", "hospitals")
+STATE_DB = os.path.join(BASE_DIR, "state.db")
+
+CATALOG_URL = "https://data.cms.gov/data.json"
+THEME = "Hospitals"
+MAX_CONCURRENT_DOWNLOADS = 5
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ------------------------------------------------------------
+# Metadata / State Tracking (local SQLite)
+# ------------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(STATE_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dataset_state (
+            dataset_id TEXT PRIMARY KEY,
+            last_modified TEXT,
+            last_run TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def get_last_modified(conn, dataset_id):
+    row = conn.execute(
+        "SELECT last_modified FROM dataset_state WHERE dataset_id = ?",
+        (dataset_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def update_state(conn, dataset_id, last_modified):
+    conn.execute("""
+        INSERT INTO dataset_state (dataset_id, last_modified, last_run)
+        VALUES (?, ?, ?)
+        ON CONFLICT(dataset_id)
+        DO UPDATE SET last_modified = excluded.last_modified,
+                     last_run = excluded.last_run
+    """, (dataset_id, last_modified, datetime.utcnow().isoformat()))
+    conn.commit()
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def to_snake_case(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[’']", "", text)
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.strip("_")
+
+
+async def fetch_json(session, url):
+    async with session.get(url, headers={"Accept": "application/json"}) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
+async def download_and_process(session, dataset, conn, semaphore):
+    async with semaphore:
+        dataset_id = dataset["identifier"]
+        modified = dataset.get("modified")
+
+        previous = get_last_modified(conn, dataset_id)
+        if previous and modified and isoparse(modified) <= isoparse(previous):
+            return
+
+        csv_url = None
+        for dist in dataset.get("distribution", []):
+            if "csv" in dist.get("mediaType", "").lower():
+                csv_url = dist.get("downloadURL")
+                break
+
+        if not csv_url:
+            return
+
+        async with session.get(csv_url) as resp:
+            resp.raise_for_status()
+            df = pd.read_csv(StringIO(await resp.text()))
+
+        df.columns = [to_snake_case(c) for c in df.columns]
+
+        df.to_csv(os.path.join(OUTPUT_DIR, f"{dataset_id}.csv"), index=False)
+
+        if modified:
+            update_state(conn, dataset_id, modified)
+
+# ------------------------------------------------------------
+# Main Job
+# ------------------------------------------------------------
+async def main():
+    conn = init_db()
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+    async with aiohttp.ClientSession() as session:
+        catalog = await fetch_json(session, CATALOG_URL)
+
+        hospital_datasets = [
+            d for d in catalog.get("dataset", [])
+            if THEME in d.get("theme", [])
+        ]
+
+        await asyncio.gather(
+            *(download_and_process(session, d, conn, semaphore)
+              for d in hospital_datasets)
+        )
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
